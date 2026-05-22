@@ -1358,7 +1358,7 @@ bool TelegramSendPhoto(const string file_name, const string caption)
    if(!ReadFileBytes(file_name, raw_bytes))
       return false;
 
-   string boundary = "----USMCBoundary" + LongToString((long)TimeTradeServer());
+   string boundary = StringFormat("----USMCBoundary_%I64d", (long)TimeTradeServer());
    char body[];
    ArrayResize(body, 0);
 
