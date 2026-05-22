@@ -51,7 +51,7 @@ input int ScreenshotHeight = 900;
 input string TelegramBotToken = "";
 input string TelegramChatId = "";
 input bool TelegramSendText = true;
-input bool TelegramSendPhoto = true;
+input bool TelegramSendPhotoAlerts = true;
 input bool PrintVerboseReasons = true;
 
 CTrade trade;
@@ -1332,7 +1332,7 @@ bool TelegramGet(const string url)
    string response_headers;
    ArrayResize(request, 0);
    ResetLastError();
-   int code = WebRequest("GET", url, "", "", 15000, request, response, response_headers);
+   int code = WebRequest("GET", url, "", 15000, request, response, response_headers);
    if(code == -1)
    {
       Print("UltimateSMCTraderEA: Telegram GET failed err=", GetLastError(), ". Add https://api.telegram.org to WebRequest allowed URLs.");
@@ -1351,7 +1351,7 @@ bool TelegramSendMessage(const string message)
 
 bool TelegramSendPhoto(const string file_name, const string caption)
 {
-   if(!TelegramConfigured() || !TelegramSendPhoto)
+   if(!TelegramConfigured() || !TelegramSendPhotoAlerts)
       return false;
 
    uchar raw_bytes[];
