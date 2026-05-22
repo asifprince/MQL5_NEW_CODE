@@ -52,6 +52,11 @@ input string TelegramBotToken = "";
 input string TelegramChatId = "";
 input bool TelegramSendText = true;
 input bool TelegramSendPhotoAlerts = true;
+input bool TelegramSendStartupPing = true;
+input bool TelegramEnableInbound = true;
+input int TelegramInboundPollSeconds = 10;
+input string TelegramInboundChatId = "";
+input string TelegramInboundOwnerId = "";
 input bool PrintVerboseReasons = true;
 
 CTrade trade;
@@ -69,6 +74,10 @@ int adx_handle = INVALID_HANDLE;
 datetime last_bar_time = 0;
 string trade_object_prefix = "USMC_";
 string last_gate_reason = "";
+bool manual_trading_pause = false;
+long telegram_last_update_id = 0;
+string last_telegram_command = "";
+datetime last_telegram_command_time = 0;
 
 struct IndicatorSnapshot
 {
@@ -167,6 +176,53 @@ string DirectionText(const int direction)
 bool TelegramConfigured()
 {
    return (TelegramBotToken != "" && TelegramChatId != "");
+}
+
+bool IsAsciiSpace(const ushort ch)
+{
+   return (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r');
+}
+
+string TrimText(const string text)
+{
+   int start = 0;
+   int end = StringLen(text) - 1;
+   while(start <= end && IsAsciiSpace((ushort)StringGetCharacter(text, start)))
+      start++;
+   while(end >= start && IsAsciiSpace((ushort)StringGetCharacter(text, end)))
+      end--;
+   if(start > end)
+      return "";
+   return StringSubstr(text, start, end - start + 1);
+}
+
+string ToLowerAscii(const string text)
+{
+   string result = "";
+   for(int i = 0; i < StringLen(text); i++)
+   {
+      ushort ch = (ushort)StringGetCharacter(text, i);
+      if(ch >= 'A' && ch <= 'Z')
+         result += CharToString((uchar)(ch + 32));
+      else
+         result += StringSubstr(text, i, 1);
+   }
+   return result;
+}
+
+string TelegramCommandToken(const string text)
+{
+   string token = ToLowerAscii(TrimText(text));
+   int newline_pos = StringFind(token, "\n");
+   if(newline_pos >= 0)
+      token = StringSubstr(token, 0, newline_pos);
+   int space_pos = StringFind(token, " ");
+   if(space_pos >= 0)
+      token = StringSubstr(token, 0, space_pos);
+   int mention_pos = StringFind(token, "@");
+   if(mention_pos > 0)
+      token = StringSubstr(token, 0, mention_pos);
+   return token;
 }
 
 double CandleBody(const MqlRates &bar)
@@ -1199,6 +1255,13 @@ bool ModifyPositionLevels(const double new_stop_loss, const double take_profit)
 {
    return trade.PositionModify(_Symbol, NormalizeDouble(new_stop_loss, _Digits), NormalizeDouble(take_profit, _Digits));
 }
+bool CloseManagedPositionBySymbol()
+{
+   ulong ticket;
+   if(!SelectManagedPositionBySymbol(ticket))
+      return false;
+   return trade.PositionClose(_Symbol);
+}
 
 void ManageOpenPosition()
 {
@@ -1207,6 +1270,11 @@ void ManageOpenPosition()
       return;
 
    long position_type = PositionGetInteger(POSITION_TYPE);
+   if(manual_trading_pause)
+   {
+      last_gate_reason = "manual pause";
+      return false;
+   }
    double entry = PositionGetDouble(POSITION_PRICE_OPEN);
    double stop_loss = PositionGetDouble(POSITION_SL);
    double take_profit = PositionGetDouble(POSITION_TP);
@@ -1325,28 +1393,270 @@ string UrlEncode(const string text)
    return encoded;
 }
 
-bool TelegramGet(const string url)
+bool TelegramGetResponse(const string url, string &body_text, int &status_code)
 {
    char request[];
    char response[];
    string response_headers;
    ArrayResize(request, 0);
    ResetLastError();
-   int code = WebRequest("GET", url, "", 15000, request, response, response_headers);
-   if(code == -1)
+   status_code = WebRequest("GET", url, "", 15000, request, response, response_headers);
+   if(status_code == -1)
    {
       Print("UltimateSMCTraderEA: Telegram GET failed err=", GetLastError(), ". Add https://api.telegram.org to WebRequest allowed URLs.");
+      body_text = "";
       return false;
    }
-   return (code >= 200 && code < 300);
+   body_text = CharArrayToString(response, 0, ArraySize(response), CP_UTF8);
+   return true;
+}
+
+bool TelegramGet(const string url)
+{
+   string body_text;
+   int status_code = 0;
+   if(!TelegramGetResponse(url, body_text, status_code))
+      return false;
+   return (status_code >= 200 && status_code < 300);
+}
+
+bool TelegramSendMessageToChat(const string chat_id, const string message)
+{
+   if(!TelegramConfigured() || !TelegramSendText || chat_id == "")
+      return false;
+   string url = "https://api.telegram.org/bot" + TelegramBotToken + "/sendMessage?chat_id=" + UrlEncode(chat_id) + "&text=" + UrlEncode(message);
+   return TelegramGet(url);
 }
 
 bool TelegramSendMessage(const string message)
 {
-   if(!TelegramConfigured() || !TelegramSendText)
+   return TelegramSendMessageToChat(TelegramChatId, message);
+}
+
+bool ExtractJsonLong(const string source, const string needle, long &value, const int start_index)
+{
+   int pos = StringFind(source, needle, start_index);
+   if(pos < 0)
       return false;
-   string url = "https://api.telegram.org/bot" + TelegramBotToken + "/sendMessage?chat_id=" + TelegramChatId + "&text=" + UrlEncode(message);
-   return TelegramGet(url);
+   pos += StringLen(needle);
+   int end = pos;
+   while(end < StringLen(source))
+   {
+      ushort ch = (ushort)StringGetCharacter(source, end);
+      if((ch >= '0' && ch <= '9') || ch == '-')
+         end++;
+      else
+         break;
+   }
+   if(end <= pos)
+      return false;
+   value = (long)StringToInteger(StringSubstr(source, pos, end - pos));
+   return true;
+}
+
+bool ExtractJsonString(const string source, const string needle, string &value, const int start_index)
+{
+   int pos = StringFind(source, needle, start_index);
+   if(pos < 0)
+      return false;
+   pos += StringLen(needle);
+   string result = "";
+   for(int i = pos; i < StringLen(source); i++)
+   {
+      ushort ch = (ushort)StringGetCharacter(source, i);
+      if(ch == '\\')
+      {
+         i++;
+         if(i >= StringLen(source))
+            break;
+         ushort escaped = (ushort)StringGetCharacter(source, i);
+         if(escaped == 'n' || escaped == 'r' || escaped == 't')
+            result += " ";
+         else
+            result += StringSubstr(source, i, 1);
+         continue;
+      }
+      if(ch == '"')
+      {
+         value = result;
+         return true;
+      }
+      result += StringSubstr(source, i, 1);
+   }
+   return false;
+}
+
+bool ExtractTelegramUpdate(const string body_text, const int start_index, int &next_index, long &update_id, long &chat_id, long &user_id, string &message_text)
+{
+   int update_pos = StringFind(body_text, "\"update_id\":", start_index);
+   if(update_pos < 0)
+   {
+      next_index = -1;
+      return false;
+   }
+
+   int next_update_pos = StringFind(body_text, "\"update_id\":", update_pos + 1);
+   string chunk = (next_update_pos < 0) ? StringSubstr(body_text, update_pos) : StringSubstr(body_text, update_pos, next_update_pos - update_pos);
+   next_index = (next_update_pos < 0) ? StringLen(body_text) : next_update_pos;
+
+   chat_id = 0;
+   user_id = 0;
+   message_text = "";
+   if(!ExtractJsonLong(chunk, "\"update_id\":", update_id, 0))
+      return false;
+
+   ExtractJsonLong(chunk, "\"chat\":{\"id\":", chat_id, 0);
+   ExtractJsonLong(chunk, "\"from\":{\"id\":", user_id, 0);
+   ExtractJsonString(chunk, "\"text\":\"", message_text, 0);
+   return true;
+}
+
+bool TelegramCommandAuthorized(const long chat_id, const long user_id)
+{
+   string effective_chat_id = (TelegramInboundChatId != "") ? TelegramInboundChatId : TelegramChatId;
+   string chat_id_text = StringFormat("%I64d", chat_id);
+   string user_id_text = StringFormat("%I64d", user_id);
+   bool chat_allowed = (effective_chat_id != "" && chat_id_text == effective_chat_id);
+   bool user_allowed = (TelegramInboundOwnerId != "" && user_id_text == TelegramInboundOwnerId);
+   if(TelegramInboundOwnerId != "")
+      return (chat_allowed || user_allowed);
+   return chat_allowed;
+}
+
+string BuildTelegramStatusMessage()
+{
+   string state = manual_trading_pause ? "paused" : "active";
+   string gate = "ready";
+   if(manual_trading_pause)
+      gate = "manual pause";
+   else if(!TradingAllowedNow())
+      gate = last_gate_reason;
+
+   ulong ticket = 0;
+   string position_line = "Position: none";
+   if(SelectManagedPositionBySymbol(ticket))
+   {
+      string side = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+      position_line = StringFormat("Position: %s %.2f ticket %I64u", side, PositionGetDouble(POSITION_VOLUME), ticket);
+   }
+
+   string last_command = (last_telegram_command == "") ? "none" : last_telegram_command;
+   if(last_telegram_command_time > 0)
+      last_command += " @ " + TimeToString(last_telegram_command_time, TIME_DATE | TIME_SECONDS);
+
+   return StringFormat(
+      "Ultimate SMC status\nSymbol: %s\nState: %s\nGate: %s\nSpread: %.1f\nToday PnL: %.2f\n%s\nLast command: %s",
+      _Symbol,
+      state,
+      gate,
+      CurrentSpreadPoints(),
+      TodayClosedPnl(),
+      position_line,
+      last_command
+   );
+}
+
+void HandleTelegramCommand(const long chat_id, const long user_id, const string raw_text)
+{
+   string command = TelegramCommandToken(raw_text);
+   if(command == "")
+      return;
+
+   if(!TelegramCommandAuthorized(chat_id, user_id))
+   {
+      Print("UltimateSMCTraderEA: ignoring unauthorized Telegram command from chat ", StringFormat("%I64d", chat_id));
+      return;
+   }
+
+   string reply_chat_id = StringFormat("%I64d", chat_id);
+   last_telegram_command = command;
+   last_telegram_command_time = TimeTradeServer();
+
+   if(command == "/status" || command == "status")
+   {
+      TelegramSendMessageToChat(reply_chat_id, BuildTelegramStatusMessage());
+      return;
+   }
+
+   if(command == "/pause" || command == "pause")
+   {
+      manual_trading_pause = true;
+      last_gate_reason = "manual pause";
+      TelegramSendMessageToChat(reply_chat_id, "Trading paused for " + _Symbol + ". Existing positions remain managed.");
+      return;
+   }
+
+   if(command == "/resume" || command == "resume")
+   {
+      manual_trading_pause = false;
+      last_gate_reason = "";
+      TelegramSendMessageToChat(reply_chat_id, "Trading resumed for " + _Symbol + ".");
+      return;
+   }
+
+   if(command == "/close" || command == "close")
+   {
+      ulong ticket = 0;
+      if(!SelectManagedPositionBySymbol(ticket))
+      {
+         TelegramSendMessageToChat(reply_chat_id, "No managed position is open for " + _Symbol + ".");
+         return;
+      }
+
+      if(CloseManagedPositionBySymbol())
+         TelegramSendMessageToChat(reply_chat_id, StringFormat("Close requested for %s ticket %I64u.", _Symbol, ticket));
+      else
+         TelegramSendMessageToChat(reply_chat_id, "Close failed: " + trade.ResultRetcodeDescription());
+      return;
+   }
+
+   if(command == "/help" || command == "help" || command == "/start" || command == "start")
+   {
+      TelegramSendMessageToChat(reply_chat_id, "Commands: /status, /pause, /resume, /close");
+      return;
+   }
+}
+
+void PollTelegramCommands(const bool process_updates)
+{
+   if(!TelegramConfigured() || !TelegramEnableInbound)
+      return;
+
+   string url = "https://api.telegram.org/bot" + TelegramBotToken + "/getUpdates?limit=5";
+   if(telegram_last_update_id > 0)
+      url += "&offset=" + UrlEncode(StringFormat("%I64d", telegram_last_update_id + 1));
+
+   string body_text;
+   int status_code = 0;
+   if(!TelegramGetResponse(url, body_text, status_code))
+      return;
+   if(status_code < 200 || status_code >= 300)
+   {
+      Print("UltimateSMCTraderEA: Telegram getUpdates returned HTTP ", status_code);
+      return;
+   }
+
+   int cursor = 0;
+   long max_update_id = telegram_last_update_id;
+   while(true)
+   {
+      int next_index = -1;
+      long update_id = 0;
+      long chat_id = 0;
+      long user_id = 0;
+      string message_text = "";
+      if(!ExtractTelegramUpdate(body_text, cursor, next_index, update_id, chat_id, user_id, message_text))
+         break;
+
+      cursor = next_index;
+      if(update_id > max_update_id)
+         max_update_id = update_id;
+
+      if(process_updates && update_id > telegram_last_update_id && message_text != "")
+         HandleTelegramCommand(chat_id, user_id, message_text);
+   }
+
+   telegram_last_update_id = max_update_id;
 }
 
 bool TelegramSendPhoto(const string file_name, const string caption)
@@ -1387,6 +1697,30 @@ bool TelegramSendPhoto(const string file_name, const string caption)
    }
    return (code >= 200 && code < 300);
 }
+
+void SendStartupTelegramPing()
+{
+   if(!TelegramConfigured())
+   {
+      Print("UltimateSMCTraderEA: Telegram disabled. Set TelegramBotToken and TelegramChatId in EA inputs.");
+      return;
+   }
+
+   if(!TelegramSendStartupPing || !TelegramSendText)
+      return;
+
+   string message = StringFormat(
+      "Ultimate SMC EA attached\nSymbol: %s\nTimeframe: %d\nServer time: %s",
+      _Symbol,
+      (int)SignalTimeframe,
+      TimeToString(TimeTradeServer(), TIME_DATE | TIME_SECONDS)
+   );
+
+   if(TelegramSendMessage(message))
+      Print("UltimateSMCTraderEA: startup Telegram ping sent.");
+   else
+      Print("UltimateSMCTraderEA: startup Telegram ping failed. Check MT5 WebRequest allowed URLs and Telegram inputs.");
+ }
 
 string CaptureTradeImage(const TradePlan &plan)
 {
@@ -1470,12 +1804,20 @@ int OnInit()
 
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(SlippagePoints);
+   if(TelegramConfigured() && TelegramEnableInbound)
+   {
+      PollTelegramCommands(false);
+      EventSetTimer(MathMax(1, TelegramInboundPollSeconds));
+      Print("UltimateSMCTraderEA: Telegram inbound polling enabled.");
+   }
+   SendStartupTelegramPing();
    Print("UltimateSMCTraderEA initialized. Allow Algo Trading, whitelist https://api.telegram.org for Telegram alerts, and enable the MT5 Economic Calendar if news blackout is used.");
    return INIT_SUCCEEDED;
 }
 
 void OnDeinit(const int reason)
 {
+   EventKillTimer();
    if(macd_handle != INVALID_HANDLE)
       IndicatorRelease(macd_handle);
    if(ama_handle != INVALID_HANDLE)
@@ -1496,6 +1838,11 @@ void OnDeinit(const int reason)
       IndicatorRelease(adx_handle);
 
    RemoveTradeObjects();
+}
+
+void OnTimer()
+{
+   PollTelegramCommands(true);
 }
 
 void OnTick()
