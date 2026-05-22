@@ -1270,11 +1270,6 @@ void ManageOpenPosition()
       return;
 
    long position_type = PositionGetInteger(POSITION_TYPE);
-   if(manual_trading_pause)
-   {
-      last_gate_reason = "manual pause";
-      return false;
-   }
    double entry = PositionGetDouble(POSITION_PRICE_OPEN);
    double stop_loss = PositionGetDouble(POSITION_SL);
    double take_profit = PositionGetDouble(POSITION_TP);
@@ -1339,19 +1334,24 @@ bool ReadFileBytes(const string file_name, uchar &bytes[])
    int handle = FileOpen(file_name, FILE_READ | FILE_BIN);
    if(handle == INVALID_HANDLE)
       return false;
-   int size = (int)FileSize(handle);
-   if(size <= 0)
+   ulong size = (ulong)FileSize(handle);
+   if(size == 0 || size > 2147483647)
    {
       FileClose(handle);
       return false;
    }
-   ArrayResize(bytes, size);
-   int read = FileReadArray(handle, bytes, 0, size);
+   ArrayResize(bytes, (int)size);
+   uint read = FileReadArray(handle, bytes, 0, (uint)size);
    FileClose(handle);
-   return (read == size);
+   return (read == (uint)size);
 }
 
 void AppendStringBytes(char &target[], const string text)
+   if(manual_trading_pause)
+   {
+      last_gate_reason = "manual pause";
+      return false;
+   }
 {
    char chunk[];
    int copied = StringToCharArray(text, chunk, 0, -1, CP_UTF8);
