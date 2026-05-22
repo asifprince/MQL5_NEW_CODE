@@ -871,6 +871,11 @@ void EnforceStopDistance(const int direction, const double entry, double &stop_l
 bool TradingAllowedNow()
 {
    last_gate_reason = "";
+   if(manual_trading_pause)
+   {
+      last_gate_reason = "manual pause";
+      return false;
+   }
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
    {
       last_gate_reason = "algo trading disabled";
@@ -1347,11 +1352,6 @@ bool ReadFileBytes(const string file_name, uchar &bytes[])
 }
 
 void AppendStringBytes(char &target[], const string text)
-   if(manual_trading_pause)
-   {
-      last_gate_reason = "manual pause";
-      return false;
-   }
 {
    char chunk[];
    int copied = StringToCharArray(text, chunk, 0, -1, CP_UTF8);
