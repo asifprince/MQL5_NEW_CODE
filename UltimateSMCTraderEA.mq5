@@ -9,7 +9,7 @@ enum SignalDirection
    DIR_SHORT = -1
 };
 
-input long MagicNumber = 2026052201;
+input ulong MagicNumber = 2026052201;
 input ENUM_TIMEFRAMES SignalTimeframe = PERIOD_M15;
 input ENUM_TIMEFRAMES BiasTimeframe = PERIOD_H1;
 input ENUM_TIMEFRAMES MacroTimeframe = PERIOD_H4;
@@ -251,6 +251,11 @@ bool CopyBufferValues(const int handle, const int buffer_index, const int start_
    return (copied >= count);
 }
 
+double RadToDeg(const double value)
+{
+   return value * 180.0 / 3.14159265358979323846;
+}
+
 double SelectMAMAPrice(const MqlRates &bar)
 {
    return (bar.high + bar.low + bar.close) / 3.0;
@@ -341,7 +346,7 @@ bool ComputeMAMASnapshot(MqlRates &rates[], double &mama, double &fama, double &
       double current_period = previous_period;
       if(MathAbs(re[i]) > 1e-8 && MathAbs(im[i]) > 1e-8)
       {
-         double angle = MathArctan(im[i] / re[i]) * 180.0 / M_PI;
+         double angle = RadToDeg(MathArctan(im[i] / re[i]));
          if(MathAbs(angle) > 1e-6)
             current_period = 360.0 / MathAbs(angle);
       }
@@ -358,7 +363,7 @@ bool ComputeMAMASnapshot(MqlRates &rates[], double &mama, double &fama, double &
 
       double current_phase = (i > 0) ? phase[i - 1] : 0.0;
       if(MathAbs(i1[i]) > 1e-8)
-         current_phase = MathArctan(q1[i] / i1[i]) * 180.0 / M_PI;
+         current_phase = RadToDeg(MathArctan(q1[i] / i1[i]));
       phase[i] = current_phase;
 
       double delta_phase = (i > 0) ? phase[i - 1] - current_phase : 1.0;
@@ -468,7 +473,7 @@ bool CalendarNewsBlocked(string &reason)
    {
       MqlCalendarValue values[];
       ResetLastError();
-      int count = CalendarValueHistory(values, from, to, NULL, currencies[currency_index]);
+      int count = CalendarValueHistory(values, from, to, "", currencies[currency_index]);
       if(count <= 0)
          continue;
 
@@ -699,7 +704,7 @@ double TodayClosedPnl()
       if(deal_ticket == 0)
          continue;
 
-      if((long)HistoryDealGetInteger(deal_ticket, DEAL_MAGIC) != (long)MagicNumber)
+      if((ulong)HistoryDealGetInteger(deal_ticket, DEAL_MAGIC) != MagicNumber)
          continue;
 
       long entry_type = HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
@@ -723,7 +728,7 @@ int CountManagedPositions()
          continue;
       if(!PositionSelectByTicket(ticket))
          continue;
-      if((long)PositionGetInteger(POSITION_MAGIC) == (long)MagicNumber)
+      if((ulong)PositionGetInteger(POSITION_MAGIC) == MagicNumber)
          total++;
    }
    return total;
@@ -741,7 +746,7 @@ bool SelectManagedPositionBySymbol(ulong &ticket)
          continue;
       if(PositionGetString(POSITION_SYMBOL) != _Symbol)
          continue;
-      if((long)PositionGetInteger(POSITION_MAGIC) != (long)MagicNumber)
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != MagicNumber)
          continue;
       ticket = pos_ticket;
       return true;
@@ -1325,8 +1330,9 @@ bool TelegramGet(const string url)
    char request[];
    char response[];
    string response_headers;
+   ArrayResize(request, 0);
    ResetLastError();
-   int code = WebRequest("GET", url, "", "", 15000, request, 0, response, response_headers);
+   int code = WebRequest("GET", url, "", "", 15000, request, response, response_headers);
    if(code == -1)
    {
       Print("UltimateSMCTraderEA: Telegram GET failed err=", GetLastError(), ". Add https://api.telegram.org to WebRequest allowed URLs.");
@@ -1352,7 +1358,7 @@ bool TelegramSendPhoto(const string file_name, const string caption)
    if(!ReadFileBytes(file_name, raw_bytes))
       return false;
 
-   string boundary = "----USMCBoundary" + IntegerToString((int)TimeTradeServer());
+   string boundary = "----USMCBoundary" + LongToString((long)TimeTradeServer());
    char body[];
    ArrayResize(body, 0);
 
@@ -1421,7 +1427,7 @@ void NotifyTrade(const TradePlan &plan, const ulong order_ticket, const double f
 
 bool ExecuteTrade(const TradePlan &plan)
 {
-   trade.SetExpertMagicNumber((int)MagicNumber);
+   trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(SlippagePoints);
 
    bool result = false;
@@ -1462,7 +1468,7 @@ int OnInit()
       return INIT_FAILED;
    }
 
-   trade.SetExpertMagicNumber((int)MagicNumber);
+   trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(SlippagePoints);
    Print("UltimateSMCTraderEA initialized. Allow Algo Trading, whitelist https://api.telegram.org for Telegram alerts, and enable the MT5 Economic Calendar if news blackout is used.");
    return INIT_SUCCEEDED;
