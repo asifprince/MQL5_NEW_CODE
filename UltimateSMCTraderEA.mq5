@@ -876,10 +876,11 @@ bool TradingAllowedNow()
       last_gate_reason = "manual pause";
       return false;
    }
-   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
+   string algo_status = AlgoTradingPermissionStatus();
+   if(algo_status != "enabled")
    {
-      last_gate_reason = "algo trading disabled";
-      Print("UltimateSMCTraderEA: algo trading is disabled in terminal or EA settings.");
+      last_gate_reason = algo_status;
+      Print("UltimateSMCTraderEA: ", algo_status);
       return false;
    }
    if(CurrentSpreadPoints() > MaxSpreadPoints)
@@ -1523,10 +1524,24 @@ bool TelegramCommandAuthorized(const long chat_id, const long user_id)
    return chat_allowed;
 }
 
+string AlgoTradingPermissionStatus()
+{
+   bool terminal_allowed = (bool)TerminalInfoInteger(TERMINAL_TRADE_ALLOWED);
+   bool ea_allowed = (bool)MQLInfoInteger(MQL_TRADE_ALLOWED);
+   if(terminal_allowed && ea_allowed)
+      return "enabled";
+   if(!terminal_allowed && !ea_allowed)
+      return "disabled: terminal AutoTrading off and EA Allow Algo Trading off";
+   if(!terminal_allowed)
+      return "disabled: terminal AutoTrading off";
+   return "disabled: EA Allow Algo Trading off";
+}
+
 string BuildTelegramStatusMessage()
 {
    string state = manual_trading_pause ? "paused" : "active";
    string gate = "ready";
+   string algo_status = AlgoTradingPermissionStatus();
    if(manual_trading_pause)
       gate = "manual pause";
    else if(!TradingAllowedNow())
@@ -1545,10 +1560,11 @@ string BuildTelegramStatusMessage()
       last_command += " @ " + TimeToString(last_telegram_command_time, TIME_DATE | TIME_SECONDS);
 
    return StringFormat(
-      "Ultimate SMC status\nSymbol: %s\nState: %s\nGate: %s\nSpread: %.1f\nToday PnL: %.2f\n%s\nLast command: %s",
+      "Ultimate SMC status\nSymbol: %s\nState: %s\nGate: %s\nAlgo: %s\nSpread: %.1f\nToday PnL: %.2f\n%s\nLast command: %s",
       _Symbol,
       state,
       gate,
+      algo_status,
       CurrentSpreadPoints(),
       TodayClosedPnl(),
       position_line,
