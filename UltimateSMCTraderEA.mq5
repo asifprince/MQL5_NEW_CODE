@@ -45,6 +45,23 @@ input bool BlockHighImpactNews = true;
 input bool BlockModerateImpactNews = false;
 input int NewsBlockBeforeMinutes = 25;
 input int NewsBlockAfterMinutes = 20;
+input bool EnableEmergencyHedge = true;
+input bool EmergencyHedgeRequireNews = true;
+input double EmergencyHedgeATRTrigger = 1.25;
+input double EmergencyHedgeBarATRTrigger = 1.75;
+input double EmergencyHedgeVolumeFactor = 1.00;
+input bool EmergencyHedgeRemoveStopLoss = true;
+input double EmergencyHedgeTakeProfitATR = 1.20;
+input int EmergencyHedgeCooldownMinutes = 45;
+input bool EmergencyHedgeAutoRelease = true;
+input int EmergencyHedgeMinHoldMinutes = 3;
+input double EmergencyHedgeReleaseATR = 0.55;
+input double EmergencyHedgeReleaseBarATR = 0.85;
+input double EmergencyHedgeHighImpactMultiplier = 1.35;
+input double EmergencyHedgeModerateImpactMultiplier = 1.10;
+input double EmergencyHedgeCryptoMultiplier = 1.25;
+input double EmergencyHedgeMetalMultiplier = 1.10;
+input double EmergencyHedgeEnergyMultiplier = 1.05;
 input string ExtraBlockedCurrencies = "";
 input int ScreenshotWidth = 1440;
 input int ScreenshotHeight = 900;
@@ -73,6 +90,7 @@ int adx_handle = INVALID_HANDLE;
 
 datetime last_bar_time = 0;
 string trade_object_prefix = "USMC_";
+string hedge_trade_prefix = "USMC_HEDGE_";
 string last_gate_reason = "";
 bool manual_trading_pause = false;
 long telegram_last_update_id = 0;
@@ -204,6 +222,20 @@ string ToLowerAscii(const string text)
       ushort ch = (ushort)StringGetCharacter(text, i);
       if(ch >= 'A' && ch <= 'Z')
          result += CharToString((uchar)(ch + 32));
+      else
+         result += StringSubstr(text, i, 1);
+   }
+   return result;
+}
+
+string ToUpperAscii(const string text)
+{
+   string result = "";
+   for(int i = 0; i < StringLen(text); i++)
+   {
+      ushort ch = (ushort)StringGetCharacter(text, i);
+      if(ch >= 'a' && ch <= 'z')
+         result += CharToString((uchar)(ch - 32));
       else
          result += StringSubstr(text, i, 1);
    }
@@ -510,9 +542,10 @@ bool CalendarImportanceBlocked(const ENUM_CALENDAR_EVENT_IMPORTANCE importance)
    return false;
 }
 
-bool CalendarNewsBlocked(string &reason)
+bool CalendarNewsBlockedDetailed(string &reason, int &impact_level)
 {
    reason = "";
+   impact_level = 0;
    if(!EnableNewsBlackout)
       return false;
 
@@ -545,12 +578,27 @@ bool CalendarNewsBlocked(string &reason)
 
          if(values[i].time >= from && values[i].time <= to)
          {
-            reason = StringFormat("news blackout %s: %s", currencies[currency_index], event.name);
-            return true;
+            int current_level = 0;
+            if(event.importance == CALENDAR_IMPORTANCE_HIGH)
+               current_level = 2;
+            else if(event.importance == CALENDAR_IMPORTANCE_MODERATE)
+               current_level = 1;
+
+            if(current_level >= impact_level)
+            {
+               impact_level = current_level;
+               reason = StringFormat("news blackout %s: %s", currencies[currency_index], event.name);
+            }
          }
       }
    }
-   return false;
+   return (impact_level > 0);
+}
+
+bool CalendarNewsBlocked(string &reason)
+{
+   int impact_level = 0;
+   return CalendarNewsBlockedDetailed(reason, impact_level);
 }
 
 bool LoadIndicators(IndicatorSnapshot &snapshot)
@@ -792,7 +840,18 @@ int CountManagedPositions()
 
 bool SelectManagedPositionBySymbol(ulong &ticket)
 {
+   return SelectManagedPositionBySymbolInternal(ticket, false, true);
+}
+
+bool IsHedgeTradeComment(const string comment)
+{
+   return (StringFind(comment, hedge_trade_prefix) == 0);
+}
+
+bool SelectManagedPositionBySymbolInternal(ulong &ticket, const bool hedge_only, const bool allow_fallback)
+{
    ticket = 0;
+   ulong fallback_ticket = 0;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong pos_ticket = PositionGetTicket(i);
@@ -804,10 +863,33 @@ bool SelectManagedPositionBySymbol(ulong &ticket)
          continue;
       if((ulong)PositionGetInteger(POSITION_MAGIC) != MagicNumber)
          continue;
-      ticket = pos_ticket;
+
+      bool is_hedge = IsHedgeTradeComment(PositionGetString(POSITION_COMMENT));
+      if(is_hedge == hedge_only)
+      {
+         ticket = pos_ticket;
+         return true;
+      }
+      if(allow_fallback && fallback_ticket == 0)
+         fallback_ticket = pos_ticket;
+   }
+
+   if(allow_fallback && fallback_ticket != 0)
+   {
+      ticket = fallback_ticket;
       return true;
    }
    return false;
+}
+
+bool SelectManagedPrimaryPositionBySymbol(ulong &ticket)
+{
+   return SelectManagedPositionBySymbolInternal(ticket, false, false);
+}
+
+bool SelectManagedHedgePositionBySymbol(ulong &ticket)
+{
+   return SelectManagedPositionBySymbolInternal(ticket, true, false);
 }
 
 double NormalizeVolume(const double volume)
@@ -1257,22 +1339,301 @@ string PartialCloseKey(const ulong ticket)
    return StringFormat("USMC_PARTIAL_%I64u", ticket);
 }
 
-bool ModifyPositionLevels(const double new_stop_loss, const double take_profit)
+string HedgeCooldownKey(const ulong ticket)
 {
-   return trade.PositionModify(_Symbol, NormalizeDouble(new_stop_loss, _Digits), NormalizeDouble(take_profit, _Digits));
+   return StringFormat("USMC_HEDGE_CD_%I64u", ticket);
 }
+
+string HedgeStopRestoreKey(const ulong ticket)
+{
+   return StringFormat("USMC_HEDGE_SL_%I64u", ticket);
+}
+
+bool ModifyPositionLevels(const ulong ticket, const double new_stop_loss, const double take_profit)
+{
+   return trade.PositionModify(ticket, NormalizeDouble(new_stop_loss, _Digits), NormalizeDouble(take_profit, _Digits));
+}
+
 bool CloseManagedPositionBySymbol()
 {
-   ulong ticket;
-   if(!SelectManagedPositionBySymbol(ticket))
+   bool closed_any = false;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+      if(!PositionSelectByTicket(ticket))
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+         continue;
+      if(trade.PositionClose(ticket))
+         closed_any = true;
+   }
+   return closed_any;
+}
+
+bool AccountSupportsHedging()
+{
+   return (AccountInfoInteger(ACCOUNT_MARGIN_MODE) == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING);
+}
+
+bool HedgeCooldownActive(const ulong ticket)
+{
+   string key = HedgeCooldownKey(ticket);
+   if(!GlobalVariableCheck(key))
       return false;
-   return trade.PositionClose(_Symbol);
+
+   datetime expires_at = (datetime)GlobalVariableGet(key);
+   if(expires_at <= TimeTradeServer())
+   {
+      GlobalVariableDel(key);
+      return false;
+   }
+   return true;
+}
+
+double HedgeCooldownRemainingMinutes(const ulong ticket)
+{
+   string key = HedgeCooldownKey(ticket);
+   if(!GlobalVariableCheck(key))
+      return 0.0;
+
+   datetime expires_at = (datetime)GlobalVariableGet(key);
+   double minutes_left = (double)(expires_at - TimeTradeServer()) / 60.0;
+   if(minutes_left <= 0.0)
+   {
+      GlobalVariableDel(key);
+      return 0.0;
+   }
+   return minutes_left;
+}
+
+void MarkHedgeCooldown(const ulong ticket)
+{
+   if(EmergencyHedgeCooldownMinutes <= 0)
+      return;
+   GlobalVariableSet(HedgeCooldownKey(ticket), (double)(TimeTradeServer() + EmergencyHedgeCooldownMinutes * 60));
+}
+
+void StoreHedgeRestoreStop(const ulong ticket, const double stop_loss)
+{
+   if(stop_loss > 0.0)
+      GlobalVariableSet(HedgeStopRestoreKey(ticket), stop_loss);
+}
+
+double LoadHedgeRestoreStop(const ulong ticket)
+{
+   string key = HedgeStopRestoreKey(ticket);
+   if(!GlobalVariableCheck(key))
+      return 0.0;
+   return GlobalVariableGet(key);
+}
+
+void ClearHedgeRestoreStop(const ulong ticket)
+{
+   string key = HedgeStopRestoreKey(ticket);
+   if(GlobalVariableCheck(key))
+      GlobalVariableDel(key);
+}
+
+bool RestoreStoredHedgeStop(const ulong ticket, const double take_profit)
+{
+   double stored_stop = LoadHedgeRestoreStop(ticket);
+   if(stored_stop <= 0.0)
+      return false;
+   if(!ModifyPositionLevels(ticket, stored_stop, take_profit))
+      return false;
+   ClearHedgeRestoreStop(ticket);
+   return true;
+}
+
+double EmergencyHedgeNewsMultiplier(const int impact_level)
+{
+   if(impact_level >= 2)
+      return EmergencyHedgeHighImpactMultiplier;
+   if(impact_level == 1)
+      return EmergencyHedgeModerateImpactMultiplier;
+   return 1.0;
+}
+
+double EmergencyHedgeSymbolMultiplier()
+{
+   string symbol = ToUpperAscii(_Symbol);
+   if(StringFind(symbol, "BTC") >= 0 || StringFind(symbol, "ETH") >= 0)
+      return EmergencyHedgeCryptoMultiplier;
+   if(StringFind(symbol, "XAU") >= 0 || StringFind(symbol, "XAG") >= 0)
+      return EmergencyHedgeMetalMultiplier;
+   if(StringFind(symbol, "OIL") >= 0 || StringFind(symbol, "WTI") >= 0 || StringFind(symbol, "BRENT") >= 0)
+      return EmergencyHedgeEnergyMultiplier;
+   return 1.0;
+}
+
+double CalculateEmergencyHedgeVolume(const double primary_volume, const int impact_level)
+{
+   double raw_volume = primary_volume * EmergencyHedgeVolumeFactor;
+   raw_volume *= EmergencyHedgeNewsMultiplier(impact_level);
+   raw_volume *= EmergencyHedgeSymbolMultiplier();
+   return NormalizeVolume(raw_volume);
+}
+
+double CurrentSignalBarRange()
+{
+   MqlRates live_bar[1];
+   ArraySetAsSeries(live_bar, true);
+   if(CopyRates(_Symbol, SignalTimeframe, 0, 1, live_bar) < 1)
+      return 0.0;
+   return live_bar[0].high - live_bar[0].low;
+}
+
+bool EmergencyHedgeTriggered(const ulong ticket, const long position_type, const double entry, const double current_price, const double atr, string &reason, int &impact_level)
+{
+   reason = "";
+   impact_level = 0;
+   if(!EnableEmergencyHedge || !AccountSupportsHedging())
+      return false;
+   if(HedgeCooldownActive(ticket))
+      return false;
+
+   ulong hedge_ticket;
+   if(SelectManagedHedgePositionBySymbol(hedge_ticket))
+      return false;
+
+   double adverse_move = (position_type == POSITION_TYPE_BUY) ? (entry - current_price) : (current_price - entry);
+   if(adverse_move < atr * EmergencyHedgeATRTrigger)
+      return false;
+
+   double live_range = CurrentSignalBarRange();
+   if(live_range < atr * EmergencyHedgeBarATRTrigger)
+      return false;
+
+   string news_reason = "";
+   bool news_active = CalendarNewsBlockedDetailed(news_reason, impact_level);
+   if(EmergencyHedgeRequireNews && !news_active)
+      return false;
+
+   reason = news_active ? news_reason : "sudden adverse move";
+   return true;
+}
+
+bool ReleaseEmergencyHedge(const ulong primary_ticket, const ulong hedge_ticket, const string release_reason, const bool send_notification)
+{
+   if(hedge_ticket == 0 || !PositionSelectByTicket(hedge_ticket))
+      return false;
+
+   double hedge_profit = PositionGetDouble(POSITION_PROFIT);
+   if(!trade.PositionClose(hedge_ticket))
+   {
+      Print("UltimateSMCTraderEA: hedge release failed retcode=", trade.ResultRetcode(), " desc=", trade.ResultRetcodeDescription());
+      return false;
+   }
+
+   if(primary_ticket != 0 && PositionSelectByTicket(primary_ticket))
+      RestoreStoredHedgeStop(primary_ticket, PositionGetDouble(POSITION_TP));
+
+   if(send_notification)
+   {
+      TelegramSendMessage(
+         StringFormat(
+            "Ultimate SMC hedge released\nSymbol: %s\nPrimary ticket: %I64u\nReason: %s\nHedge PnL: %.2f",
+            _Symbol,
+            primary_ticket,
+            release_reason,
+            hedge_profit
+         )
+      );
+   }
+   return true;
+}
+
+bool EmergencyHedgeShouldAutoRelease(const ulong primary_ticket, const ulong hedge_ticket, const long position_type, const double entry, const double current_price, const double atr, string &reason)
+{
+   reason = "";
+   if(!EmergencyHedgeAutoRelease || hedge_ticket == 0)
+      return false;
+   if(!PositionSelectByTicket(hedge_ticket))
+      return false;
+
+   datetime hedge_open_time = (datetime)PositionGetInteger(POSITION_TIME);
+   if(EmergencyHedgeMinHoldMinutes > 0 && TimeTradeServer() - hedge_open_time < EmergencyHedgeMinHoldMinutes * 60)
+      return false;
+
+   double live_range = CurrentSignalBarRange();
+   if(live_range <= 0.0 || live_range > atr * EmergencyHedgeReleaseBarATR)
+      return false;
+
+   double adverse_move = (position_type == POSITION_TYPE_BUY) ? (entry - current_price) : (current_price - entry);
+   if(adverse_move <= atr * EmergencyHedgeReleaseATR)
+   {
+      reason = "volatility normalized";
+      return true;
+   }
+
+   if(PositionGetDouble(POSITION_PROFIT) > 0.0 && adverse_move <= atr * EmergencyHedgeATRTrigger)
+   {
+      reason = "hedge profit harvested after shock cooling";
+      return true;
+   }
+   return false;
+}
+
+bool OpenEmergencyHedge(const ulong primary_ticket, const long position_type, const double primary_volume, const double primary_stop_loss, const double primary_take_profit, const double atr, const string trigger_reason, const int impact_level)
+{
+   double hedge_volume = CalculateEmergencyHedgeVolume(primary_volume, impact_level);
+   double min_volume = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   if(hedge_volume < min_volume)
+      return false;
+
+   bool stop_removed = true;
+   if(EmergencyHedgeRemoveStopLoss && primary_stop_loss > 0.0)
+   {
+      StoreHedgeRestoreStop(primary_ticket, primary_stop_loss);
+      stop_removed = ModifyPositionLevels(primary_ticket, 0.0, primary_take_profit);
+   }
+
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(SlippagePoints);
+
+   bool placed = false;
+   string hedge_label = hedge_trade_prefix + _Symbol;
+   if(position_type == POSITION_TYPE_BUY)
+   {
+      double hedge_tp = NormalizeDouble(SymbolInfoDouble(_Symbol, SYMBOL_BID) - atr * EmergencyHedgeTakeProfitATR, _Digits);
+      placed = trade.Sell(hedge_volume, _Symbol, 0.0, 0.0, hedge_tp, hedge_label);
+   }
+   else if(position_type == POSITION_TYPE_SELL)
+   {
+      double hedge_tp = NormalizeDouble(SymbolInfoDouble(_Symbol, SYMBOL_ASK) + atr * EmergencyHedgeTakeProfitATR, _Digits);
+      placed = trade.Buy(hedge_volume, _Symbol, 0.0, 0.0, hedge_tp, hedge_label);
+   }
+
+   if(!placed)
+   {
+      Print("UltimateSMCTraderEA: emergency hedge failed retcode=", trade.ResultRetcode(), " desc=", trade.ResultRetcodeDescription());
+      return false;
+   }
+
+   MarkHedgeCooldown(primary_ticket);
+   TelegramSendMessage(
+      StringFormat(
+         "Ultimate SMC hedge activated\nSymbol: %s\nPrimary ticket: %I64u\nReason: %s\nHedge volume: %.2f\nNews factor: %.2f\nSymbol factor: %.2f\nSL removed: %s",
+         _Symbol,
+         primary_ticket,
+         trigger_reason,
+         hedge_volume,
+         EmergencyHedgeNewsMultiplier(impact_level),
+         EmergencyHedgeSymbolMultiplier(),
+         stop_removed ? "yes" : "no"
+      )
+   );
+   return true;
 }
 
 void ManageOpenPosition()
 {
    ulong ticket;
-   if(!SelectManagedPositionBySymbol(ticket))
+   if(!SelectManagedPrimaryPositionBySymbol(ticket))
       return;
 
    long position_type = PositionGetInteger(POSITION_TYPE);
@@ -1286,6 +1647,42 @@ void ManageOpenPosition()
    if(!CopyBufferValues(atr_handle, 0, 1, 1, atr_values))
       return;
    double atr = atr_values[0];
+
+   ulong hedge_ticket;
+   bool hedge_active = SelectManagedHedgePositionBySymbol(hedge_ticket);
+   if(hedge_active)
+   {
+      string release_reason = "";
+      if(EmergencyHedgeShouldAutoRelease(ticket, hedge_ticket, position_type, entry, current_price, atr, release_reason))
+      {
+         if(ReleaseEmergencyHedge(ticket, hedge_ticket, release_reason, true) && PositionSelectByTicket(ticket))
+         {
+            stop_loss = PositionGetDouble(POSITION_SL);
+            take_profit = PositionGetDouble(POSITION_TP);
+         }
+      }
+
+      if(SelectManagedHedgePositionBySymbol(hedge_ticket))
+         return;
+   }
+
+   if(stop_loss == 0.0)
+   {
+      if(RestoreStoredHedgeStop(ticket, take_profit) && PositionSelectByTicket(ticket))
+      {
+         stop_loss = PositionGetDouble(POSITION_SL);
+         take_profit = PositionGetDouble(POSITION_TP);
+      }
+   }
+
+   string hedge_reason = "";
+   int hedge_impact_level = 0;
+   if(EmergencyHedgeTriggered(ticket, position_type, entry, current_price, atr, hedge_reason, hedge_impact_level))
+   {
+      if(OpenEmergencyHedge(ticket, position_type, volume, stop_loss, take_profit, atr, hedge_reason, hedge_impact_level))
+         return;
+   }
+
    double risk = MathAbs(entry - stop_loss);
    if(risk <= _Point || atr <= _Point)
       return;
@@ -1296,18 +1693,18 @@ void ManageOpenPosition()
    if(rr >= BreakEvenAtRR)
    {
       if(position_type == POSITION_TYPE_BUY && (stop_loss < break_even_sl || stop_loss == 0.0))
-         ModifyPositionLevels(break_even_sl, take_profit);
+         ModifyPositionLevels(ticket, break_even_sl, take_profit);
       else if(position_type == POSITION_TYPE_SELL && (stop_loss > break_even_sl || stop_loss == 0.0))
-         ModifyPositionLevels(break_even_sl, take_profit);
+         ModifyPositionLevels(ticket, break_even_sl, take_profit);
    }
 
    double trail_stop = (position_type == POSITION_TYPE_BUY) ? current_price - atr * TrailATRMultiplier : current_price + atr * TrailATRMultiplier;
    if(rr > BreakEvenAtRR)
    {
       if(position_type == POSITION_TYPE_BUY && trail_stop > stop_loss)
-         ModifyPositionLevels(trail_stop, take_profit);
+         ModifyPositionLevels(ticket, trail_stop, take_profit);
       else if(position_type == POSITION_TYPE_SELL && trail_stop < stop_loss)
-         ModifyPositionLevels(trail_stop, take_profit);
+         ModifyPositionLevels(ticket, trail_stop, take_profit);
    }
 
    string partial_key = PartialCloseKey(ticket);
@@ -1317,7 +1714,7 @@ void ManageOpenPosition()
       double min_volume = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
       if(close_volume >= min_volume && close_volume < volume)
       {
-         if(trade.PositionClosePartial(_Symbol, close_volume))
+         if(trade.PositionClosePartial(ticket, close_volume))
             GlobalVariableSet(partial_key, TimeTradeServer());
       }
    }
@@ -1547,12 +1944,20 @@ string BuildTelegramStatusMessage()
    else if(!TradingAllowedNow())
       gate = last_gate_reason;
 
-   ulong ticket = 0;
-   string position_line = "Position: none";
-   if(SelectManagedPositionBySymbol(ticket))
+   ulong primary_ticket = 0;
+   string position_line = "Primary: none";
+   if(SelectManagedPrimaryPositionBySymbol(primary_ticket))
    {
       string side = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? "BUY" : "SELL";
-      position_line = StringFormat("Position: %s %.2f ticket %I64u", side, PositionGetDouble(POSITION_VOLUME), ticket);
+      position_line = StringFormat("Primary: %s %.2f ticket %I64u", side, PositionGetDouble(POSITION_VOLUME), primary_ticket);
+   }
+
+   ulong hedge_ticket = 0;
+   string hedge_line = "Hedge: none";
+   if(SelectManagedHedgePositionBySymbol(hedge_ticket))
+   {
+      string hedge_side = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+      hedge_line = StringFormat("Hedge: %s %.2f ticket %I64u", hedge_side, PositionGetDouble(POSITION_VOLUME), hedge_ticket);
    }
 
    string last_command = (last_telegram_command == "") ? "none" : last_telegram_command;
@@ -1560,7 +1965,7 @@ string BuildTelegramStatusMessage()
       last_command += " @ " + TimeToString(last_telegram_command_time, TIME_DATE | TIME_SECONDS);
 
    return StringFormat(
-      "Ultimate SMC status\nSymbol: %s\nState: %s\nGate: %s\nAlgo: %s\nSpread: %.1f\nToday PnL: %.2f\n%s\nLast command: %s",
+      "Ultimate SMC status\nSymbol: %s\nState: %s\nGate: %s\nAlgo: %s\nSpread: %.1f\nToday PnL: %.2f\n%s\n%s\nLast command: %s",
       _Symbol,
       state,
       gate,
@@ -1568,7 +1973,49 @@ string BuildTelegramStatusMessage()
       CurrentSpreadPoints(),
       TodayClosedPnl(),
       position_line,
+      hedge_line,
       last_command
+   );
+}
+
+string BuildHedgeStatusMessage()
+{
+   string account_mode = AccountSupportsHedging() ? "hedging" : "netting";
+
+   ulong primary_ticket = 0;
+   string primary_line = "Primary: none";
+   string stop_line = "Primary SL removed: no";
+   string cooldown_line = "Cooldown: ready";
+   if(SelectManagedPrimaryPositionBySymbol(primary_ticket))
+   {
+      string side = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+      primary_line = StringFormat("Primary: %s %.2f ticket %I64u", side, PositionGetDouble(POSITION_VOLUME), primary_ticket);
+      stop_line = StringFormat("Primary SL removed: %s", PositionGetDouble(POSITION_SL) == 0.0 ? "yes" : "no");
+
+      double cooldown_left = HedgeCooldownRemainingMinutes(primary_ticket);
+      if(cooldown_left > 0.0)
+         cooldown_line = StringFormat("Cooldown: %.1f min", cooldown_left);
+   }
+
+   ulong hedge_ticket = 0;
+   string hedge_line = "Hedge: none";
+   string hedge_pnl_line = "Hedge PnL: 0.00";
+   if(SelectManagedHedgePositionBySymbol(hedge_ticket))
+   {
+      string hedge_side = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+      hedge_line = StringFormat("Hedge: %s %.2f ticket %I64u", hedge_side, PositionGetDouble(POSITION_VOLUME), hedge_ticket);
+      hedge_pnl_line = StringFormat("Hedge PnL: %.2f", PositionGetDouble(POSITION_PROFIT));
+   }
+
+   return StringFormat(
+      "Ultimate SMC hedge\nSymbol: %s\nAccount mode: %s\n%s\n%s\n%s\n%s\nAuto release: %s",
+      _Symbol,
+      account_mode,
+      primary_line,
+      hedge_line,
+      hedge_pnl_line,
+      cooldown_line,
+      EmergencyHedgeAutoRelease ? "enabled" : "disabled"
    );
 }
 
@@ -1591,6 +2038,12 @@ void HandleTelegramCommand(const long chat_id, const long user_id, const string 
    if(command == "/status" || command == "status")
    {
       TelegramSendMessageToChat(reply_chat_id, BuildTelegramStatusMessage());
+      return;
+   }
+
+   if(command == "/hedge" || command == "hedge" || command == "/hedge_status" || command == "hedge_status")
+   {
+      TelegramSendMessageToChat(reply_chat_id, BuildHedgeStatusMessage());
       return;
    }
 
@@ -1626,9 +2079,27 @@ void HandleTelegramCommand(const long chat_id, const long user_id, const string 
       return;
    }
 
+   if(command == "/unhedge" || command == "unhedge" || command == "/release_hedge" || command == "release_hedge")
+   {
+      ulong hedge_ticket = 0;
+      if(!SelectManagedHedgePositionBySymbol(hedge_ticket))
+      {
+         TelegramSendMessageToChat(reply_chat_id, "No hedge is active for " + _Symbol + ".");
+         return;
+      }
+
+      ulong primary_ticket = 0;
+      SelectManagedPrimaryPositionBySymbol(primary_ticket);
+      if(ReleaseEmergencyHedge(primary_ticket, hedge_ticket, "manual Telegram release", false))
+         TelegramSendMessageToChat(reply_chat_id, StringFormat("Hedge released for %s ticket %I64u.", _Symbol, hedge_ticket));
+      else
+         TelegramSendMessageToChat(reply_chat_id, "Hedge release failed: " + trade.ResultRetcodeDescription());
+      return;
+   }
+
    if(command == "/help" || command == "help" || command == "/start" || command == "start")
    {
-      TelegramSendMessageToChat(reply_chat_id, "Commands: /status, /pause, /resume, /close");
+      TelegramSendMessageToChat(reply_chat_id, "Commands: /status, /hedge, /unhedge, /pause, /resume, /close");
       return;
    }
 }
